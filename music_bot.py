@@ -3,6 +3,8 @@ import sys
 import asyncio
 import logging
 import urllib.parse
+import urllib.request
+import json
 import re
 import datetime
 import shutil
@@ -75,27 +77,22 @@ def setup_youtube_cookies():
             logger.info("🍪 Đã nạp YOUTUBE_COOKIES_BASE64 vào data/cookies.txt!")
         except Exception as e:
             logger.warning(f"Không thể giải mã YOUTUBE_COOKIES_BASE64: {e}")
-    elif os.environ.get("YOUTUBE_COOKIES", "").strip():
-        try:
-            with open(COOKIE_PATH, "w", encoding="utf-8") as f:
-                f.write(os.environ["YOUTUBE_COOKIES"])
-            logger.info("🍪 Đã nạp YOUTUBE_COOKIES vào data/cookies.txt!")
-        except Exception as e:
-            logger.warning(f"Không thể ghi YOUTUBE_COOKIES: {e}")
 
 setup_youtube_cookies()
 
 def get_ytdl_instance(use_cookies: bool = True):
     opts = dict(YTDL_OPTIONS)
-    if use_cookies and os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 10:
+    if use_cookies and os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 100:
         opts['cookiefile'] = COOKIE_PATH
     return yt_dlp.YoutubeDL(opts)
 
 ytdl = get_ytdl_instance(use_cookies=True)
 ytdl_nocookie = get_ytdl_instance(use_cookies=False)
 
-IDLE_MUSIC_URL = "https://www.youtube.com/watch?v=_RTy21niS0g"
-IDLE_MUSIC_TITLE = "Monstercat Instinct Vol. 6 (Album Mix)"
+# Monstercat Instinct Vol. 6 (Album Mix) - Stream 24/7 theo yêu cầu của Boss
+MONSTERCAT_SC_STREAM = "https://soundcloud.com/spookstervibes/monstercat-instinct-vol-6-album-mix"
+MONSTERCAT_YT_STREAM = "https://www.youtube.com/watch?v=_RTy21niS0g"
+IDLE_MUSIC_TITLE = "Monstercat Instinct Vol. 6 (Album Mix) 24/7"
 
 # ==================== KEEP-ALIVE WEB SERVER ====================
 async def handle_ping(request):
@@ -148,27 +145,45 @@ class MusicSubBot(commands.Bot):
 bot = MusicSubBot()
 
 # ==================== AUDIO EXTRACTION ENGINE ====================
+def fetch_youtube_oembed_title(url: str) -> tuple[str, str]:
+    """Lấy tiêu đề YouTube an toàn 100% qua oEmbed API không bao giờ bị chặn IP."""
+    try:
+        req = urllib.request.Request(
+            f"https://www.youtube.com/oembed?url={urllib.parse.quote(url)}&format=json",
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get('title', ''), data.get('author_name', '')
+    except Exception:
+        return '', ''
+
 async def extract_audio_info(query: str) -> dict | None:
     loop = asyncio.get_event_loop()
+    is_yt_link = "youtube.com" in query or "youtu.be" in query
 
-    # Làm sạch URL nếu là link YouTube dính rác playlist
-    if "youtube.com" in query or "youtu.be" in query:
+    clean_yt_url = query
+    oembed_title = ""
+    oembed_author = ""
+
+    # Làm sạch URL nếu là link YouTube dính query rác
+    if is_yt_link:
         parsed = urllib.parse.urlparse(query)
         qs = urllib.parse.parse_qs(parsed.query)
         if "watch" in parsed.path and "v" in qs:
-            query = f"https://www.youtube.com/watch?v={qs['v'][0]}"
+            clean_yt_url = f"https://www.youtube.com/watch?v={qs['v'][0]}"
         elif "youtu.be" in parsed.netloc:
             vid = parsed.path.strip("/").split("?")[0]
-            query = f"https://www.youtube.com/watch?v={vid}"
+            clean_yt_url = f"https://www.youtube.com/watch?v={vid}"
 
-    # TẦNG 1: Trích xuất YouTube qua yt-dlp (web_embedded/android)
-    for current_ytdl in [ytdl, ytdl_nocookie]:
+        # Lấy trước tiêu đề thực qua oEmbed
+        oembed_title, oembed_author = await loop.run_in_executor(None, lambda: fetch_youtube_oembed_title(clean_yt_url))
+
+    # TẦNG 1: Trích xuất YouTube qua yt-dlp
+    if is_yt_link:
         try:
-            data = await loop.run_in_executor(None, lambda: current_ytdl.extract_info(query, download=False))
+            data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(clean_yt_url, download=False))
             if data:
-                if 'entries' in data and data['entries']:
-                    data = data['entries'][0]
-
                 audio_url = data.get('url')
                 headers = data.get('http_headers', {})
                 if not audio_url and 'formats' in data:
@@ -181,37 +196,43 @@ async def extract_audio_info(query: str) -> dict | None:
 
                 if audio_url:
                     return {
-                        'title': data.get('title', 'Unknown Title'),
+                        'title': data.get('title', oembed_title or 'Unknown Title'),
                         'url': audio_url,
                         'headers': headers,
-                        'webpage_url': data.get('webpage_url', query),
+                        'webpage_url': data.get('webpage_url', clean_yt_url),
                         'duration': data.get('duration', 0),
                         'thumbnail': data.get('thumbnail'),
-                        'uploader': data.get('uploader', 'Unknown Artist'),
+                        'uploader': data.get('uploader', oembed_author or 'YouTube'),
                         'is_idle': False
                     }
         except Exception as e:
-            logger.warning(f"Tầng 1 yt-dlp thất bại ({query[:60]}...): {e}")
+            logger.warning(f"Tầng 1 YouTube bị chặn ({e}). Tự động kích hoạt Cứu hộ HQ...")
 
-    # TẦNG 2: Cứu hộ tự động qua SoundCloud nếu YouTube bị chặn
-    clean_query = re.sub(r'https?://[^\s]+', '', query).strip()
-    if not clean_query:
-        clean_query = query.split("/")[-1].replace("-", " ")
+    # TẦNG 2: Cứu hộ tự động qua SoundCloud HQ (Không chặn IP Datacenter)
+    sc_query_term = oembed_title if oembed_title else re.sub(r'https?://[^\s]+', '', query).strip()
+    if not sc_query_term:
+        sc_query_term = query.split("/")[-1].replace("-", " ")
 
-    sc_query = f"scsearch5:{clean_query}"
-    logger.info(f"🔄 Kích hoạt Tầng 2 cứu hộ âm thanh SoundCloud: {sc_query}")
+    # Nếu trực tiếp là link SoundCloud
+    if "soundcloud.com" in query:
+        sc_target = query
+    else:
+        sc_target = f"scsearch5:{sc_query_term}"
+
+    logger.info(f"🔄 Kích hoạt Tầng 2 SoundCloud HQ: {sc_target}")
     try:
-        data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(sc_query, download=False))
-        if data and 'entries' in data and data['entries']:
-            entry = data['entries'][0]
+        data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(sc_target, download=False))
+        if data:
+            entry = data['entries'][0] if 'entries' in data and data['entries'] else data
             audio_url = entry.get('url')
             if audio_url:
-                logger.info(f"✅ Tầng 2 cứu hộ thành công: {entry.get('title')}")
+                title = entry.get('title', oembed_title or sc_query_term)
+                logger.info(f"✅ Tầng 2 cứu hộ thành công: {title}")
                 return {
-                    'title': f"{entry.get('title', 'Unknown')} [SoundCloud HQ]",
+                    'title': f"{title} [HQ Stream]",
                     'url': audio_url,
                     'headers': entry.get('http_headers', {}),
-                    'webpage_url': entry.get('webpage_url', ''),
+                    'webpage_url': entry.get('webpage_url', clean_yt_url),
                     'duration': entry.get('duration', 0),
                     'thumbnail': entry.get('thumbnail'),
                     'uploader': entry.get('uploader', 'SoundCloud'),
@@ -223,20 +244,30 @@ async def extract_audio_info(query: str) -> dict | None:
     return None
 
 async def extract_idle_stream() -> dict | None:
-    # Trích xuất Monstercat Instinct Vol. 6 Album Mix
-    res = await extract_audio_info(IDLE_MUSIC_URL)
+    loop = asyncio.get_event_loop()
+    # 1. Thử stream SoundCloud HQ của Monstercat Instinct Vol. 6 (siêu mượt, không lỗi bản quyền trên Render)
+    try:
+        data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(MONSTERCAT_SC_STREAM, download=False))
+        if data and data.get('url'):
+            return {
+                'title': IDLE_MUSIC_TITLE,
+                'url': data.get('url'),
+                'headers': data.get('http_headers', {}),
+                'webpage_url': MONSTERCAT_YT_STREAM,
+                'duration': data.get('duration', 7712),
+                'thumbnail': data.get('thumbnail'),
+                'uploader': 'Monstercat',
+                'is_idle': True
+            }
+    except Exception as e:
+        logger.warning(f"SoundCloud Monstercat idle thất bại: {e}")
+
+    # 2. Thử dự phòng YouTube URL
+    res = await extract_audio_info(MONSTERCAT_YT_STREAM)
     if res:
         res['title'] = IDLE_MUSIC_TITLE
         res['is_idle'] = True
         return res
-
-    # Dự phòng nếu YouTube lỗi mạng: stream qua SoundCloud Monstercat Mix
-    logger.warning("Thử stream dự phòng Monstercat SoundCloud...")
-    res_sc = await extract_audio_info("scsearch1:Monstercat Instinct Album Mix")
-    if res_sc:
-        res_sc['title'] = "Monstercat Instinct Mix [HQ Stream]"
-        res_sc['is_idle'] = True
-        return res_sc
 
     return None
 
@@ -269,7 +300,7 @@ async def get_or_join_voice_client(guild: discord.Guild, target_channel: discord
     # Nếu bot đã kết nối voice trong server:
     if guild.voice_client and guild.voice_client.is_connected():
         vc = guild.voice_client
-        # Nếu đang ở khác phòng so với target_channel -> CHUYỂN PHÒNG!
+        # Nếu đang ở phòng khác so với target_channel -> CHUYỂN PHÒNG!
         if vc.channel.id != target_channel.id:
             logger.info(f"🔄 Chuyển bot từ [{vc.channel.name}] sang [{target_channel.name}]")
             await vc.move_to(target_channel)
@@ -373,7 +404,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         if len(humans) == 0:
             logger.info(f"Phòng [{vc.channel.name}] không còn thành viên nào. Bot trở về [{base_channel.name}] trong 3s...")
             await asyncio.sleep(3)
-            # Kiểm tra lại xem có ai vào chưa
+            # Kiểm tra lại xem có ai vào lại chưa
             if len([m for m in vc.channel.members if not m.bot]) == 0:
                 bot.queues[guild.id] = []
                 if vc.is_playing():
@@ -496,7 +527,7 @@ async def slash_radio(interaction: discord.Interaction, genre: app_commands.Choi
     target_ch = user_voice.channel if user_voice else guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
 
     streams = {
-        "monstercat": "https://www.youtube.com/watch?v=_RTy21niS0g",
+        "monstercat": MONSTERCAT_SC_STREAM,
         "lofi": "scsearch5:lofi hip hop radio beats to relax chill",
         "synthwave": "scsearch5:synthwave radio chillwave",
         "anime": "scsearch5:peaceful anime piano lofi",
