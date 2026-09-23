@@ -89,7 +89,7 @@ def get_ytdl_instance(use_cookies: bool = True):
 ytdl = get_ytdl_instance(use_cookies=True)
 ytdl_nocookie = get_ytdl_instance(use_cookies=False)
 
-# Monstercat Instinct Vol. 6 (Album Mix) - Stream 24/7 theo yêu cầu của Boss
+# Monstercat Instinct Vol. 6 (Album Mix) 24/7
 MONSTERCAT_SC_STREAM = "https://soundcloud.com/spookstervibes/monstercat-instinct-vol-6-album-mix"
 MONSTERCAT_YT_STREAM = "https://www.youtube.com/watch?v=_RTy21niS0g"
 IDLE_MUSIC_TITLE = "Monstercat Instinct Vol. 6 (Album Mix) 24/7"
@@ -102,9 +102,23 @@ async def handle_ping(request):
         charset="utf-8"
     )
 
+async def handle_status(request):
+    guild = bot.get_guild(config.OFFICIAL_GUILD_ID)
+    vc = guild.voice_client if guild else None
+    return aiohttp_web.json_response({
+        "status": "online",
+        "vc_connected": vc.is_connected() if vc else False,
+        "vc_playing": vc.is_playing() if vc else False,
+        "vc_channel": vc.channel.name if (vc and vc.channel) else None,
+        "idle_active": bot.idle_active.get(guild.id, False) if guild else False,
+        "now_playing": bot.now_playing.get(guild.id, {}).get("title", "None") if guild else "None",
+        "queue_len": len(bot.queues.get(guild.id, [])) if guild else 0
+    })
+
 async def start_web_server():
     app = aiohttp_web.Application()
     app.router.add_get('/', handle_ping)
+    app.router.add_get('/status', handle_status)
     runner = aiohttp_web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
@@ -166,7 +180,7 @@ async def extract_audio_info(query: str) -> dict | None:
     oembed_title = ""
     oembed_author = ""
 
-    # Làm sạch URL nếu là link YouTube dính query rác
+    # Làm sạch URL nếu là link YouTube
     if is_yt_link:
         parsed = urllib.parse.urlparse(query)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -176,7 +190,6 @@ async def extract_audio_info(query: str) -> dict | None:
             vid = parsed.path.strip("/").split("?")[0]
             clean_yt_url = f"https://www.youtube.com/watch?v={vid}"
 
-        # Lấy trước tiêu đề thực qua oEmbed
         oembed_title, oembed_author = await loop.run_in_executor(None, lambda: fetch_youtube_oembed_title(clean_yt_url))
 
     # TẦNG 1: Trích xuất YouTube qua yt-dlp
@@ -206,14 +219,13 @@ async def extract_audio_info(query: str) -> dict | None:
                         'is_idle': False
                     }
         except Exception as e:
-            logger.warning(f"Tầng 1 YouTube bị chặn ({e}). Tự động kích hoạt Cứu hộ HQ...")
+            logger.warning(f"Tầng 1 YouTube bị chặn ({e}). Tự động kích hoạt Cứu hộ SoundCloud HQ...")
 
     # TẦNG 2: Cứu hộ tự động qua SoundCloud HQ (Không chặn IP Datacenter)
     sc_query_term = oembed_title if oembed_title else re.sub(r'https?://[^\s]+', '', query).strip()
     if not sc_query_term:
         sc_query_term = query.split("/")[-1].replace("-", " ")
 
-    # Nếu trực tiếp là link SoundCloud
     if "soundcloud.com" in query:
         sc_target = query
     else:
@@ -245,7 +257,7 @@ async def extract_audio_info(query: str) -> dict | None:
 
 async def extract_idle_stream() -> dict | None:
     loop = asyncio.get_event_loop()
-    # 1. Thử stream SoundCloud HQ của Monstercat Instinct Vol. 6 (siêu mượt, không lỗi bản quyền trên Render)
+    # 1. Thử stream SoundCloud HQ của Monstercat Instinct Vol. 6
     try:
         data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(MONSTERCAT_SC_STREAM, download=False))
         if data and data.get('url'):
@@ -274,10 +286,14 @@ async def extract_idle_stream() -> dict | None:
 def create_pcm_source(track: dict, volume: float = 1.0) -> discord.PCMVolumeTransformer:
     headers = track.get('headers', {})
     header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()]) if headers else ""
-    if header_str:
+    is_m3u8 = ".m3u8" in track['url'] or "playlist.m3u8" in track['url']
+
+    if header_str and not is_m3u8:
         before_opts = f'-headers "{header_str}" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
-    else:
+    elif not is_m3u8:
         before_opts = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+    else:
+        before_opts = None  # HLS playlist m3u8 tự xử lý segment reconnection
 
     audio = discord.FFmpegPCMAudio(
         track['url'],
@@ -287,12 +303,12 @@ def create_pcm_source(track: dict, volume: float = 1.0) -> discord.PCMVolumeTran
     )
     return discord.PCMVolumeTransformer(audio, volume=volume)
 
-# ==================== VOICE & PLAYBACK CORE ====================
-async def get_or_join_voice_client(guild: discord.Guild, target_channel: discord.VoiceChannel = None) -> discord.VoiceClient | None:
+# ==================== VOICE & PLAYBACK CORE (LOCKED TO CUSTOM MUSIC) ====================
+async def get_or_join_voice_client(guild: discord.Guild) -> discord.VoiceClient | None:
+    """Đảm bảo bot luôn luôn kết nối vào phòng DUY NHẤT: 🎵・Custom Music."""
+    target_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
     if not target_channel:
-        target_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
-        if not target_channel:
-            target_channel = discord.utils.find(lambda c: "music" in c.name.lower() or "nhạc" in c.name.lower(), guild.voice_channels)
+        target_channel = discord.utils.find(lambda c: "custom music" in c.name.lower() or "nhạc" in c.name.lower(), guild.voice_channels)
 
     if not target_channel:
         return None
@@ -300,15 +316,14 @@ async def get_or_join_voice_client(guild: discord.Guild, target_channel: discord
     # Nếu bot đã kết nối voice trong server:
     if guild.voice_client and guild.voice_client.is_connected():
         vc = guild.voice_client
-        # Nếu đang ở phòng khác so với target_channel -> CHUYỂN PHÒNG!
         if vc.channel.id != target_channel.id:
-            logger.info(f"🔄 Chuyển bot từ [{vc.channel.name}] sang [{target_channel.name}]")
+            logger.info(f"🔄 Đưa bot về cố định tại phòng [{target_channel.name}]")
             await vc.move_to(target_channel)
         return vc
 
-    # Chưa kết nối -> Kết nối mới
+    # Kết nối mới
     try:
-        vc = await target_channel.connect(reconnect=True, timeout=15.0)
+        vc = await target_channel.connect(reconnect=True, timeout=20.0)
         return vc
     except Exception as e:
         logger.error(f"Lỗi kết nối phòng voice: {e}")
@@ -386,62 +401,89 @@ async def start_idle_music(guild: discord.Guild):
     vc.play(source, after=after_idle)
     logger.info("✅ Monstercat Instinct IDLE 24/7 đang ngân vang.")
 
-# ==================== VOICE STATE LISTENER (AUTO-RETURN TO BASE) ====================
-@bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    guild = member.guild
-    vc = guild.voice_client
-    if not vc or not vc.is_connected():
+# ==================== DỰNG BÀI VÀ PHÁT NHẠC CHUNG (DÙNG CHO CẢ SLASH VÀ CHAT MESSAGE) ====================
+async def process_and_play(send_target, query: str, requester: discord.User | discord.Member):
+    guild = send_target.guild if hasattr(send_target, "guild") else None
+    if not guild:
         return
 
-    base_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
-    if not base_channel:
+    vc = await get_or_join_voice_client(guild)
+    if not vc:
+        if hasattr(send_target, "send"):
+            await send_target.send("❌ Bot không thể kết nối tới phòng `🎵・Custom Music`!", ephemeral=True)
         return
 
-    # Nếu bot đang ở phòng voice khác phòng gốc (ví dụ Room riêng của user):
-    if vc.channel.id != base_channel.id:
-        humans = [m for m in vc.channel.members if not m.bot]
-        if len(humans) == 0:
-            logger.info(f"Phòng [{vc.channel.name}] không còn thành viên nào. Bot trở về [{base_channel.name}] trong 3s...")
-            await asyncio.sleep(3)
-            # Kiểm tra lại xem có ai vào lại chưa
-            if len([m for m in vc.channel.members if not m.bot]) == 0:
-                bot.queues[guild.id] = []
-                if vc.is_playing():
-                    vc.stop()
-                await vc.move_to(base_channel)
-                await start_idle_music(guild)
+    # Thông báo trạng thái đang tải
+    status_msg = None
+    if hasattr(send_target, "send"):
+        try:
+            status_msg = await send_target.send(f"🔎 Đang nạp bài hát: `{query[:60]}...`")
+        except Exception:
+            pass
+
+    track = await extract_audio_info(query)
+    if not track:
+        err_text = f"❌ Không thể tìm thấy hoặc trích xuất âm thanh từ: `{query}`"
+        if status_msg:
+            await status_msg.edit(content=err_text)
+        elif hasattr(send_target, "send"):
+            await send_target.send(err_text, ephemeral=True)
+        return
+
+    q = bot.queues.setdefault(guild.id, [])
+    track['requester'] = requester.display_name
+
+    embed = discord.Embed(
+        title="🎵 THÊM BÀI HÁT THÀNH CÔNG",
+        description=f"[{track['title']}]({track.get('webpage_url', '')})\n\n"
+                    f"⏱️ **Thời lượng:** `{datetime.timedelta(seconds=track['duration']) if track['duration'] else 'Livestream'}`\n"
+                    f"🔊 **Kênh:** `🎵・Custom Music`\n"
+                    f"👤 **Yêu cầu bởi:** {requester.mention}",
+        color=config.COLOR_SUCCESS
+    )
+    if track.get('thumbnail'):
+        embed.set_thumbnail(url=track['thumbnail'])
+
+    # Nếu đang phát nhạc nền IDLE hoặc không phát gì -> phát ngay bài mới!
+    if bot.idle_active.get(guild.id, False) or not vc.is_playing():
+        if vc.is_playing():
+            vc.stop()
+        q.insert(0, track)
+        play_next(guild)
+        embed.title = "🎶 ĐANG PHÁT BÀI HÁT"
+        if status_msg:
+            await status_msg.edit(content=None, embed=embed)
+        else:
+            await send_target.send(embed=embed)
+    else:
+        q.append(track)
+        embed.set_footer(text=f"Vị trí trong hàng chờ: #{len(q)}")
+        if status_msg:
+            await status_msg.edit(content=None, embed=embed)
+        else:
+            await send_target.send(embed=embed)
 
 # ==================== 24/7 VOICE MONITOR TASK ====================
-@tasks.loop(seconds=35)
+@tasks.loop(seconds=30)
 async def voice_health_check():
     guild = bot.get_guild(config.OFFICIAL_GUILD_ID)
     if not guild:
         return
 
-    base_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
     vc = guild.voice_client
-
     if not vc or not vc.is_connected():
-        if base_channel:
-            logger.info("🔄 Tự động tái kết nối phòng 🎵・Custom Music...")
-            vc = await get_or_join_voice_client(guild, base_channel)
-            if vc:
-                await start_idle_music(guild)
+        logger.info("🔄 Tự động kết nối cố định vào phòng 🎵・Custom Music...")
+        vc = await get_or_join_voice_client(guild)
+        if vc and not vc.is_playing():
+            await start_idle_music(guild)
     else:
-        # Nếu bot đang ở phòng phụ nhưng phòng phụ không còn ai:
-        if base_channel and vc.channel.id != base_channel.id:
-            humans = [m for m in vc.channel.members if not m.bot]
-            if len(humans) == 0:
-                logger.info(f"Phòng vắng người, tự động đưa bot về lại [{base_channel.name}]...")
-                bot.queues[guild.id] = []
-                if vc.is_playing():
-                    vc.stop()
-                await vc.move_to(base_channel)
-                await start_idle_music(guild)
-                return
+        # Nếu đang ở khác phòng Custom Music, đưa về Custom Music
+        if vc.channel.id != config.CUSTOM_MUSIC_CHANNEL_ID:
+            base_ch = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
+            if base_ch:
+                await vc.move_to(base_ch)
 
-        # Nếu không phát nhạc gì và không bị pause -> Tiếp tục phát
+        # Nếu không phát bài nào và không pause -> Tiếp tục phát
         if not vc.is_playing() and not vc.is_paused():
             play_next(guild)
 
@@ -451,162 +493,102 @@ async def on_ready():
     if not voice_health_check.is_running():
         voice_health_check.start()
 
-    guild = bot.get_guild(config.OFFICIAL_GUILD_ID)
-    if guild:
-        base_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
-        if base_channel:
-            vc = await get_or_join_voice_client(guild, base_channel)
-            if vc and not vc.is_playing():
-                await start_idle_music(guild)
-
-# ==================== SLASH COMMANDS ====================
-@bot.tree.command(name="play", description="🎵 Phát nhạc từ YouTube, SoundCloud hoặc tìm kiếm bài hát")
-@app_commands.describe(query="Link bài hát (YouTube/SoundCloud) hoặc tên bài hát cần tìm")
-async def slash_play(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    guild = interaction.guild
-
-    user_voice = getattr(interaction.user, "voice", None)
-    target_ch = user_voice.channel if user_voice else guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
-
-    if not target_ch:
-        await interaction.followup.send("❌ Bạn cần vào một phòng voice hoặc tạo phòng riêng để bot tham gia nhé!", ephemeral=True)
+# ==================== CHAT MESSAGE LISTENER (AUTO-PLAY ON PASTE) ====================
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
         return
 
-    # Kết nối hoặc chuyển sang phòng voice của người gọi lệnh
-    vc = await get_or_join_voice_client(guild, target_ch)
-    if not vc:
-        await interaction.followup.send("❌ Bot không thể tham gia phòng voice của bạn!", ephemeral=True)
+    content = message.content.strip()
+    if not content:
         return
 
-    track = await extract_audio_info(query)
-    if not track:
-        await interaction.followup.send(f"❌ Không thể tìm thấy hoặc trích xuất âm thanh từ: `{query}`", ephemeral=True)
-        return
-
-    q = bot.queues.setdefault(guild.id, [])
-    track['requester'] = interaction.user.display_name
-
-    embed = discord.Embed(
-        title="🎵 THÊM BÀI HÁT THÀNH CÔNG",
-        description=f"[{track['title']}]({track.get('webpage_url', '')})\n\n"
-                    f"⏱️ **Thời lượng:** `{datetime.timedelta(seconds=track['duration']) if track['duration'] else 'Livestream'}`\n"
-                    f"🔊 **Phòng Voice:** {target_ch.mention}\n"
-                    f"👤 **Yêu cầu bởi:** {interaction.user.mention}",
-        color=config.COLOR_SUCCESS
+    # Nhận diện nếu chat trong kênh âm nhạc hoặc mention bot
+    is_music_channel = (
+        message.channel.id == config.CUSTOM_MUSIC_CHANNEL_ID or
+        "custom-music" in getattr(message.channel, "name", "").lower() or
+        "music" in getattr(message.channel, "name", "").lower()
     )
-    if track.get('thumbnail'):
-        embed.set_thumbnail(url=track['thumbnail'])
+    is_mentioned = bot.user.mentioned_in(message)
 
-    # Nếu bot đang phát nhạc nền IDLE hoặc không phát gì -> phát ngay bài mới!
-    if bot.idle_active.get(guild.id, False) or not vc.is_playing():
-        if vc.is_playing():
-            vc.stop()
-        q.insert(0, track)
-        play_next(guild)
-        embed.title = "🎶 ĐANG PHÁT BÀI HÁT"
-        await interaction.followup.send(embed=embed)
-    else:
-        q.append(track)
-        embed.set_footer(text=f"Vị trí trong hàng chờ: #{len(q)}")
-        await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="radio", description="📻 Bật đài phát thanh 24/7 theo thể loại yêu thích")
-@app_commands.choices(genre=[
-    app_commands.Choice(name="🐱 Monstercat EDM / Instinct", value="monstercat"),
-    app_commands.Choice(name="☕ Lofi Chill Beats 24/7", value="lofi"),
-    app_commands.Choice(name="⚡ Synthwave / Cyberpunk 24/7", value="synthwave"),
-    app_commands.Choice(name="🍃 Piano & Peaceful Anime", value="anime"),
-    app_commands.Choice(name="🌌 Dreamcore / Weirdcore Ambient", value="dreamcore")
-])
-async def slash_radio(interaction: discord.Interaction, genre: app_commands.Choice[str]):
-    await interaction.response.defer()
-    guild = interaction.guild
-
-    user_voice = getattr(interaction.user, "voice", None)
-    target_ch = user_voice.channel if user_voice else guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
-
-    streams = {
-        "monstercat": MONSTERCAT_SC_STREAM,
-        "lofi": "scsearch5:lofi hip hop radio beats to relax chill",
-        "synthwave": "scsearch5:synthwave radio chillwave",
-        "anime": "scsearch5:peaceful anime piano lofi",
-        "dreamcore": "scsearch5:dreamcore weirdcore playlist"
-    }
-
-    q_str = streams.get(genre.value, streams["monstercat"])
-    track = await extract_audio_info(q_str)
-    if not track:
-        await interaction.followup.send("❌ Không thể nạp kênh Radio này lúc này, vui lòng thử lại sau!", ephemeral=True)
+    # 1. Các lệnh text nhanh: skip, stop, queue, np
+    cmd = content.lower()
+    if cmd in ("!skip", "skip", "next"):
+        await do_skip(message.channel)
+        return
+    elif cmd in ("!stop", "stop"):
+        await do_stop(message.channel)
+        return
+    elif cmd in ("!queue", "queue", "hangcho"):
+        await do_queue(message.channel)
+        return
+    elif cmd in ("!np", "np", "nowplaying"):
+        await do_np(message.channel)
         return
 
-    vc = await get_or_join_voice_client(guild, target_ch)
-    if not vc:
-        await interaction.followup.send("❌ Không thể kết nối tới phòng phát thanh!", ephemeral=True)
-        return
+    # 2. Nhận diện link bài hát hoặc lệnh play
+    url_match = re.search(r'(https?://[^\s]+)', content)
+    is_play_cmd = cmd.startswith("!play ") or cmd.startswith("play ")
 
-    if vc.is_playing():
-        vc.stop()
+    query = None
+    if url_match:
+        query = url_match.group(1)
+    elif is_play_cmd:
+        query = content.split(" ", 1)[1].strip()
+    elif is_music_channel and len(content) > 2 and not content.startswith("/"):
+        # Trong kênh chat âm nhạc, người dùng gửi bất kỳ tên bài hát nào cũng tự động tìm và phát!
+        query = content
 
-    bot.queues[guild.id] = []
-    bot.now_playing[guild.id] = track
-    bot.idle_active[guild.id] = False
+    if query:
+        try:
+            await message.add_reaction("🎵")
+        except Exception:
+            pass
+        await process_and_play(message.channel, query, message.author)
 
-    vol = bot.volumes.get(guild.id, 1.0)
-    try:
-        source = create_pcm_source(track, volume=vol)
-    except Exception as e:
-        logger.error(f"Lỗi tạo radio audio source: {e}")
-        await interaction.followup.send("❌ Lỗi khi khởi động stream radio!", ephemeral=True)
-        return
-
-    def after_radio(err):
-        play_next(guild)
-
-    vc.play(source, after=after_radio)
-
-    embed = discord.Embed(
-        title="📻 ĐÃ KÍCH HOẠT ĐÀI PHÁT THANH 24/7",
-        description=f"✨ Thể loại: **{genre.name}**\n\n🎶 Đang phát: [{track['title']}]({track.get('webpage_url', '')})\n🔊 Phòng: {target_ch.mention}",
-        color=config.COLOR_GOLD
-    )
-    if track.get('thumbnail'):
-        embed.set_thumbnail(url=track['thumbnail'])
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="skip", description="⏭️ Bỏ qua bài hát hiện tại")
-async def slash_skip(interaction: discord.Interaction):
-    guild = interaction.guild
+# ==================== TEXT & SLASH ACTION HELPERS ====================
+async def do_skip(send_target):
+    guild = send_target.guild
     vc = guild.voice_client if guild else None
     if vc and vc.is_playing():
         vc.stop()
-        await interaction.response.send_message("⏭️ Đã bỏ qua bài hát hiện tại! Đang chuyển tiếp... 🗿🍷")
+        await send_target.send("⏭️ Đã bỏ qua bài hát hiện tại! Đang chuyển tiếp... 🗿🍷")
     else:
-        await interaction.response.send_message("❌ Hiện không có bài hát nào đang phát để skip.", ephemeral=True)
+        await send_target.send("❌ Hiện không có bài hát nào đang phát để skip.", delete_after=5)
 
-@bot.tree.command(name="stop", description="⏹️ Dừng phát nhạc và đưa bot về lại phòng 🎵・Custom Music")
-async def slash_stop(interaction: discord.Interaction):
-    guild = interaction.guild
+async def do_stop(send_target):
+    guild = send_target.guild
     bot.queues[guild.id] = []
     vc = guild.voice_client if guild else None
-
-    base_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
     if vc and vc.is_playing():
         vc.stop()
-
-    # Nếu đang ở phòng riêng, đưa bot về trạm gốc
-    if vc and base_channel and vc.channel.id != base_channel.id:
-        await vc.move_to(base_channel)
-
-    await interaction.response.send_message("⏹️ Đã dừng phát nhạc, dọn sạch hàng chờ và khôi phục Monstercat 24/7 tại trạm gốc! 🎧")
+    await send_target.send("⏹️ Đã dừng phát nhạc, dọn sạch hàng chờ và khôi phục Monstercat 24/7! 🎧")
     await start_idle_music(guild)
 
-@bot.tree.command(name="nowplaying", description="🎧 Xem bài hát đang phát hiện tại")
-async def slash_np(interaction: discord.Interaction):
-    guild = interaction.guild
+async def do_queue(send_target):
+    guild = send_target.guild
+    q = bot.queues.get(guild.id, [])
+    if not q:
+        await send_target.send("📜 Hàng chờ hiện đang trống. Bot đang phát nhạc Monstercat 24/7! 🐱")
+        return
+
+    desc = ""
+    for idx, t in enumerate(q[:10], 1):
+        dur = str(datetime.timedelta(seconds=t['duration'])) if t.get('duration') else "Live"
+        desc += f"`#{idx}` **{t['title'][:45]}** — `{dur}` *(bởi {t.get('requester', 'Ẩn danh')})*\n"
+
+    embed = discord.Embed(
+        title=f"📜 DANH SÁCH BÀI HÁT ĐANG CHỜ ({len(q)} bài)",
+        description=desc,
+        color=config.COLOR_CYAN
+    )
+    await send_target.send(embed=embed)
+
+async def do_np(send_target):
+    guild = send_target.guild
     track = bot.now_playing.get(guild.id)
     if not track:
-        await interaction.response.send_message("❌ Hiện tại chưa có bài hát nào được phát.", ephemeral=True)
+        await send_target.send("❌ Hiện tại chưa có bài hát nào được phát.")
         return
 
     is_idle = bot.idle_active.get(guild.id, False)
@@ -623,27 +605,38 @@ async def slash_np(interaction: discord.Interaction):
     )
     if track.get('thumbnail'):
         embed.set_thumbnail(url=track['thumbnail'])
-    await interaction.response.send_message(embed=embed)
+    await send_target.send(embed=embed)
+
+# ==================== SLASH COMMANDS ====================
+@bot.tree.command(name="play", description="🎵 Phát nhạc từ YouTube, SoundCloud hoặc tìm kiếm bài hát")
+@app_commands.describe(query="Link bài hát (YouTube/SoundCloud) hoặc tên bài hát cần tìm")
+async def slash_play(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+    await process_and_play(interaction.followup, query, interaction.user)
+
+@bot.tree.command(name="skip", description="⏭️ Bỏ qua bài hát hiện tại")
+async def slash_skip(interaction: discord.Interaction):
+    await do_skip(interaction.channel)
+    if not interaction.response.is_done():
+        await interaction.response.send_message("⏭️ Skip!", ephemeral=True)
+
+@bot.tree.command(name="stop", description="⏹️ Dừng phát nhạc và khôi phục Monstercat 24/7")
+async def slash_stop(interaction: discord.Interaction):
+    await do_stop(interaction.channel)
+    if not interaction.response.is_done():
+        await interaction.response.send_message("⏹️ Stop!", ephemeral=True)
+
+@bot.tree.command(name="nowplaying", description="🎧 Xem bài hát đang phát hiện tại")
+async def slash_np(interaction: discord.Interaction):
+    await do_np(interaction.channel)
+    if not interaction.response.is_done():
+        await interaction.response.send_message("🎧 Now Playing", ephemeral=True)
 
 @bot.tree.command(name="queue", description="📜 Xem danh sách hàng chờ bài hát")
 async def slash_queue(interaction: discord.Interaction):
-    guild = interaction.guild
-    q = bot.queues.get(guild.id, [])
-    if not q:
-        await interaction.response.send_message("📜 Hàng chờ hiện đang trống. Bot đang phát nhạc Monstercat 24/7! 🐱", ephemeral=True)
-        return
-
-    desc = ""
-    for idx, t in enumerate(q[:10], 1):
-        dur = str(datetime.timedelta(seconds=t['duration'])) if t.get('duration') else "Live"
-        desc += f"`#{idx}` **{t['title'][:45]}** — `{dur}` *(bởi {t.get('requester', 'Ẩn danh')})*\n"
-
-    embed = discord.Embed(
-        title=f"📜 DANH SÁCH BÀI HÁT ĐANG CHỜ ({len(q)} bài)",
-        description=desc,
-        color=config.COLOR_CYAN
-    )
-    await interaction.response.send_message(embed=embed)
+    await do_queue(interaction.channel)
+    if not interaction.response.is_done():
+        await interaction.response.send_message("📜 Queue", ephemeral=True)
 
 @bot.tree.command(name="volume", description="🔊 Điều chỉnh âm lượng nhạc (1 - 100)")
 @app_commands.describe(level="Mức âm lượng từ 1 đến 100")
