@@ -487,6 +487,44 @@ async def voice_health_check():
         if not vc.is_playing() and not vc.is_paused():
             play_next(guild)
 
+    # Đảm bảo tắt mic cho tất cả mọi người trong Custom Music để nghe nhạc tập trung
+    base_ch = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
+    if not base_ch:
+        base_ch = discord.utils.find(lambda c: "custom" in c.name.lower() and "music" in c.name.lower(), guild.voice_channels)
+    if base_ch:
+        for m in base_ch.members:
+            if not m.bot and m.voice and not m.voice.mute:
+                try:
+                    await m.edit(mute=True, reason="Kênh Custom Music: Tự động tắt mic nghe nhạc")
+                    logger.info(f"🔇 Sub-bot: Đã tắt mic định kỳ cho {m.display_name} trong phòng Custom Music")
+                except Exception as e:
+                    logger.warning(f"Không thể tắt mic cho {m.display_name}: {e}")
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot:
+        return
+
+    is_custom_music_after = after.channel and (
+        after.channel.id == config.CUSTOM_MUSIC_CHANNEL_ID or
+        ("custom" in after.channel.name.lower() and "music" in after.channel.name.lower())
+    )
+
+    if is_custom_music_after:
+        if member.voice and not member.voice.mute:
+            try:
+                await member.edit(mute=True, reason="Kênh Custom Music: Tự động tắt mic nghe nhạc")
+                logger.info(f"🔇 Sub-bot: Đã tắt mic cho {member.display_name} trong phòng Custom Music")
+            except Exception as e:
+                logger.warning(f"Không thể tắt mic cho {member.display_name}: {e}")
+    elif after.channel and not is_custom_music_after:
+        if member.voice and member.voice.mute:
+            try:
+                await member.edit(mute=False, reason="Ở phòng thoại thông thường: Mở lại mic tự do")
+                logger.info(f"🔊 Sub-bot: Đã mở mic lại cho {member.display_name} tại {after.channel.name}")
+            except Exception as e:
+                logger.warning(f"Không thể mở mic cho {member.display_name}: {e}")
+
 @bot.event
 async def on_ready():
     logger.info(f"👑 MUSIC SUB-BOT ĐÃ SẴN SÀNG: {bot.user.name}#{bot.user.discriminator} (ID: {bot.user.id})")
