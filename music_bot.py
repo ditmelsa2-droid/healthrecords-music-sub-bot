@@ -115,10 +115,29 @@ async def handle_status(request):
         "queue_len": len(bot.queues.get(guild.id, [])) if guild else 0
     })
 
+async def handle_reconnect(request):
+    guild = bot.get_guild(config.OFFICIAL_GUILD_ID)
+    if not guild:
+        return aiohttp_web.Response(text="Guild not found", status=404)
+    if guild.voice_client:
+        try:
+            if guild.voice_client.is_playing():
+                guild.voice_client.stop()
+            await guild.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    vc = await get_or_join_voice_client(guild)
+    if vc:
+        await start_idle_music(guild)
+        return aiohttp_web.Response(text="Reconnected and started idle music!")
+    return aiohttp_web.Response(text="Failed to reconnect", status=500)
+
 async def start_web_server():
     app = aiohttp_web.Application()
     app.router.add_get('/', handle_ping)
     app.router.add_get('/status', handle_status)
+    app.router.add_get('/reconnect', handle_reconnect)
     runner = aiohttp_web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
@@ -304,6 +323,12 @@ def create_pcm_source(track: dict, volume: float = 1.0) -> discord.PCMVolumeTran
     return discord.PCMVolumeTransformer(audio, volume=volume)
 
 # ==================== VOICE & PLAYBACK CORE (LOCKED TO CUSTOM MUSIC) ====================
+async def reconnect_after_kick(guild: discord.Guild):
+    logger.info("🔄 Tiến hành tự động kết nối lại sau khi bị ngắt kết nối...")
+    vc = await get_or_join_voice_client(guild)
+    if vc and not vc.is_playing():
+        await start_idle_music(guild)
+
 async def get_or_join_voice_client(guild: discord.Guild) -> discord.VoiceClient | None:
     """Đảm bảo bot luôn luôn kết nối vào phòng DUY NHẤT: 🎵・Custom Music."""
     target_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
@@ -311,22 +336,52 @@ async def get_or_join_voice_client(guild: discord.Guild) -> discord.VoiceClient 
         target_channel = discord.utils.find(lambda c: "custom music" in c.name.lower() or "nhạc" in c.name.lower(), guild.voice_channels)
 
     if not target_channel:
+        logger.error("❌ Không tìm thấy phòng Custom Music trong server!")
         return None
 
-    # Nếu bot đã kết nối voice trong server:
-    if guild.voice_client and guild.voice_client.is_connected():
+    # Nếu bot đã có voice_client trong server:
+    if guild.voice_client:
         vc = guild.voice_client
-        if vc.channel.id != target_channel.id:
-            logger.info(f"🔄 Đưa bot về cố định tại phòng [{target_channel.name}]")
-            await vc.move_to(target_channel)
-        return vc
+        if vc.is_connected():
+            if vc.channel and vc.channel.id != target_channel.id:
+                logger.info(f"🔄 Đưa bot về cố định tại phòng [{target_channel.name}]")
+                try:
+                    await vc.move_to(target_channel)
+                except Exception as e:
+                    logger.warning(f"Lỗi move_to: {e}")
+            return vc
+        else:
+            logger.warning("⚠️ Phát hiện Voice Client zombie (mất kết nối) -> Force disconnect sạch...")
+            try:
+                if vc.is_playing():
+                    vc.stop()
+            except Exception:
+                pass
+            try:
+                await vc.disconnect(force=True)
+            except Exception as e:
+                logger.warning(f"Lỗi disconnect zombie vc: {e}")
+            await asyncio.sleep(1.5)
 
     # Kết nối mới
     try:
-        vc = await target_channel.connect(reconnect=True, timeout=20.0)
+        vc = await target_channel.connect(reconnect=True, timeout=25.0)
+        logger.info(f"✅ Đã kết nối thành công vào phòng [{target_channel.name}]")
         return vc
     except Exception as e:
         logger.error(f"Lỗi kết nối phòng voice: {e}")
+        # Nếu Discord vẫn báo Already connected -> Ép disconnect lần cuối rồi thử lại
+        if "already connected" in str(e).lower() and guild.voice_client:
+            try:
+                if guild.voice_client.is_playing():
+                    guild.voice_client.stop()
+                await guild.voice_client.disconnect(force=True)
+                await asyncio.sleep(1.5)
+                vc = await target_channel.connect(reconnect=True, timeout=25.0)
+                logger.info(f"✅ Đã kết nối lại thành công sau retry force disconnect!")
+                return vc
+            except Exception as ex2:
+                logger.error(f"Lỗi kết nối lại sau retry: {ex2}")
         return None
 
 def play_next(guild: discord.Guild):
@@ -356,8 +411,12 @@ def play_next(guild: discord.Guild):
                 logger.error(f"Playback error: {err}")
             asyncio.run_coroutine_threadsafe(handle_after_playback(guild), bot.loop)
 
-        vc.play(source, after=after_callback)
-        logger.info(f"🎶 Đang phát: {track['title']} ({vol*100:.0f}% vol)")
+        try:
+            vc.play(source, after=after_callback)
+            logger.info(f"🎶 Đang phát: {track['title']} ({vol*100:.0f}% vol)")
+        except Exception as e:
+            logger.error(f"Lỗi vc.play in play_next: {e}")
+            bot.loop.call_later(2, lambda: play_next(guild))
     else:
         # Hàng chờ rỗng -> Bật nhạc nền Monstercat IDLE 24/7
         asyncio.run_coroutine_threadsafe(start_idle_music(guild), bot.loop)
@@ -371,16 +430,22 @@ async def start_idle_music(guild: discord.Guild):
         return
 
     vc = guild.voice_client
-    if not vc.is_connected() or vc.is_playing():
+    if not vc.is_connected():
+        return
+
+    if vc.is_playing():
         return
 
     logger.info(f"🎧 Kích hoạt Monstercat Instinct IDLE 24/7 tại {guild.name}...")
     track = await extract_idle_stream()
     if not track:
-        logger.warning("Không thể lấy stream Monstercat IDLE. Thử lại sau 15s...")
-        await asyncio.sleep(15)
-        if not vc.is_playing():
+        logger.warning("Không thể lấy stream Monstercat IDLE. Thử lại sau 10s...")
+        await asyncio.sleep(10)
+        if guild.voice_client and guild.voice_client.is_connected() and not guild.voice_client.is_playing():
             play_next(guild)
+        return
+
+    if not guild.voice_client or not guild.voice_client.is_connected() or guild.voice_client.is_playing():
         return
 
     bot.now_playing[guild.id] = track
@@ -391,6 +456,7 @@ async def start_idle_music(guild: discord.Guild):
         source = create_pcm_source(track, volume=vol)
     except Exception as e:
         logger.error(f"Lỗi tạo idle audio source: {e}")
+        bot.loop.call_later(5, lambda: play_next(guild))
         return
 
     def after_idle(err):
@@ -398,8 +464,12 @@ async def start_idle_music(guild: discord.Guild):
             logger.warning(f"Idle stream ended: {err}")
         asyncio.run_coroutine_threadsafe(handle_after_playback(guild), bot.loop)
 
-    vc.play(source, after=after_idle)
-    logger.info("✅ Monstercat Instinct IDLE 24/7 đang ngân vang.")
+    try:
+        guild.voice_client.play(source, after=after_idle)
+        logger.info("✅ Monstercat Instinct IDLE 24/7 đang ngân vang.")
+    except Exception as e:
+        logger.error(f"Lỗi vc.play idle: {e}")
+        bot.loop.call_later(5, lambda: play_next(guild))
 
 # ==================== DỰNG BÀI VÀ PHÁT NHẠC CHUNG (DÙNG CHO CẢ SLASH VÀ CHAT MESSAGE) ====================
 async def process_and_play(send_target, query: str, requester: discord.User | discord.Member):
@@ -464,30 +534,47 @@ async def process_and_play(send_target, query: str, requester: discord.User | di
             await send_target.send(embed=embed)
 
 # ==================== 24/7 VOICE MONITOR TASK ====================
-@tasks.loop(seconds=30)
+@tasks.loop(seconds=15)
 async def voice_health_check():
     guild = bot.get_guild(config.OFFICIAL_GUILD_ID)
     if not guild:
         return
 
     vc = guild.voice_client
+    # 1. Phát hiện và xử lý Zombie Voice Client (mất kết nối nhưng client chưa giải phóng)
+    if vc and not vc.is_connected():
+        logger.warning("⚠️ [HealthCheck] Phát hiện Voice Client zombie -> Force disconnect và làm mới...")
+        try:
+            if vc.is_playing():
+                vc.stop()
+        except Exception:
+            pass
+        try:
+            await vc.disconnect(force=True)
+        except Exception as e:
+            logger.warning(f"Lỗi disconnect zombie: {e}")
+        await asyncio.sleep(1.5)
+        vc = None
+
+    # 2. Đảm bảo bot luôn kết nối vào phòng Custom Music
     if not vc or not vc.is_connected():
-        logger.info("🔄 Tự động kết nối cố định vào phòng 🎵・Custom Music...")
+        logger.info("🔄 [HealthCheck] Tự động kết nối cố định vào phòng 🎵・Custom Music...")
         vc = await get_or_join_voice_client(guild)
         if vc and not vc.is_playing():
             await start_idle_music(guild)
     else:
         # Nếu đang ở khác phòng Custom Music, đưa về Custom Music
-        if vc.channel.id != config.CUSTOM_MUSIC_CHANNEL_ID:
+        if vc.channel and vc.channel.id != config.CUSTOM_MUSIC_CHANNEL_ID:
             base_ch = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
             if base_ch:
                 await vc.move_to(base_ch)
 
-        # Nếu không phát bài nào và không pause -> Tiếp tục phát
+        # Nếu đã kết nối nhưng KHÔNG phát gì -> phát tiếp
         if not vc.is_playing() and not vc.is_paused():
+            logger.info("🔊 [HealthCheck] Bot đang im lặng trong phòng voice -> Tiếp tục phát nhạc...")
             play_next(guild)
 
-    # Đảm bảo tắt mic cho tất cả mọi người trong Custom Music để nghe nhạc tập trung
+    # 3. Đảm bảo tắt mic cho tất cả mọi người trong Custom Music để nghe nhạc tập trung
     base_ch = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
     if not base_ch:
         base_ch = discord.utils.find(lambda c: "custom" in c.name.lower() and "music" in c.name.lower(), guild.voice_channels)
@@ -502,6 +589,13 @@ async def voice_health_check():
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # Nếu chính Sub-Bot bị ngắt kết nối voice (gateway restart, network glitch, v.v.):
+    if member.id == bot.user.id:
+        if before.channel and not after.channel:
+            logger.warning("⚠️ Sub-Bot vừa bị ngắt khỏi phòng voice! Lên lịch kết nối lại trong 2s...")
+            bot.loop.call_later(2, lambda: asyncio.create_task(reconnect_after_kick(member.guild)))
+        return
+
     if member.bot:
         return
 
