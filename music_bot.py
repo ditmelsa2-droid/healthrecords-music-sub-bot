@@ -626,9 +626,16 @@ async def on_ready():
         voice_health_check.start()
 
 # ==================== CHAT MESSAGE LISTENER (AUTO-PLAY ON PASTE) ====================
+EXCLUDED_NON_MUSIC_DOMAINS = (
+    "discord.gg", "discord.com", "discordapp.com",
+    "tenor.com", "giphy.com", "imgur.com", "github.com",
+    "facebook.com", "fb.watch", "tiktok.com", "instagram.com",
+    "twitter.com", "x.com", "reddit.com"
+)
+
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         return
 
     content = message.content.strip()
@@ -636,47 +643,84 @@ async def on_message(message: discord.Message):
         return
 
     # Nhận diện nếu chat trong kênh âm nhạc hoặc mention bot
+    channel_name = getattr(message.channel, "name", "").lower()
     is_music_channel = (
         message.channel.id == config.CUSTOM_MUSIC_CHANNEL_ID or
-        "custom-music" in getattr(message.channel, "name", "").lower() or
-        "music" in getattr(message.channel, "name", "").lower()
+        "custom-music" in channel_name or
+        "phong-nghe-nhac" in channel_name or
+        "am-nhac" in channel_name or
+        "music" in channel_name
     )
     is_mentioned = bot.user.mentioned_in(message)
+    cmd = content.lower()
+    is_play_prefix = cmd.startswith("!play ") or cmd.startswith("play ") or cmd.startswith("!p ")
+
+    # NẾU KHÔNG PHẢI KÊNH ÂM NHẠC, VÀ KHÔNG GÕ LỆNH !PLAY, VÀ KHÔNG MENTION BOT:
+    # -> BỎ QUA HOÀN TOÀN, TUYỆT ĐỐI KHÔNG CAN THIỆP TIN NHẮN Ở CÁC KÊNH KHÁC!
+    if not is_music_channel and not is_mentioned and not is_play_prefix:
+        return
 
     # 1. Các lệnh text nhanh: skip, stop, queue, np
-    cmd = content.lower()
-    if cmd in ("!skip", "skip", "next"):
-        await do_skip(message.channel)
-        return
+    if cmd in ("!skip", "!next", "skip", "next"):
+        if is_music_channel or cmd.startswith("!"):
+            await do_skip(message.channel)
+            return
     elif cmd in ("!stop", "stop"):
-        await do_stop(message.channel)
-        return
-    elif cmd in ("!queue", "queue", "hangcho"):
-        await do_queue(message.channel)
-        return
+        if is_music_channel or cmd.startswith("!"):
+            await do_stop(message.channel)
+            return
+    elif cmd in ("!queue", "queue", "hangcho", "!q"):
+        if is_music_channel or cmd.startswith("!"):
+            await do_queue(message.channel)
+            return
     elif cmd in ("!np", "np", "nowplaying"):
-        await do_np(message.channel)
-        return
+        if is_music_channel or cmd.startswith("!"):
+            await do_np(message.channel)
+            return
 
     # 2. Nhận diện link bài hát hoặc lệnh play
     url_match = re.search(r'(https?://[^\s]+)', content)
-    is_play_cmd = cmd.startswith("!play ") or cmd.startswith("play ")
 
     query = None
-    if url_match:
-        query = url_match.group(1)
-    elif is_play_cmd:
-        query = content.split(" ", 1)[1].strip()
-    elif is_music_channel and len(content) > 2 and not content.startswith("/"):
-        # Trong kênh chat âm nhạc, người dùng gửi bất kỳ tên bài hát nào cũng tự động tìm và phát!
-        query = content
+    if is_play_prefix:
+        # Nếu gõ rõ ràng !play <bài hát/link>
+        parts = content.split(" ", 1)
+        if len(parts) > 1 and parts[1].strip():
+            query = parts[1].strip()
+    elif is_mentioned and any(kw in cmd for kw in ["play", "phát", "hát", "bài"]):
+        # Nếu mention bot kèm yêu cầu phát nhạc
+        cleaned = re.sub(rf'<@!?{bot.user.id}>', '', content, flags=re.IGNORECASE).strip()
+        for kw in ["play", "phát nhạc", "phát", "hát"]:
+            if cleaned.lower().startswith(kw):
+                cleaned = cleaned[len(kw):].strip()
+                break
+        if cleaned:
+            query = cleaned
+    elif is_music_channel:
+        # CHỈ TRONG KÊNH ÂM NHẠC MỚI TỰ ĐỘNG BẮT LINK DÁN VÀ TÊN BÀI HÁT
+        if url_match:
+            raw_url = url_match.group(1)
+            # Kiểm tra xem có phải link không liên quan (như discord.gg, meme gif, mạng xã hội) không
+            if any(domain in raw_url.lower() for domain in EXCLUDED_NON_MUSIC_DOMAINS):
+                return
+            query = raw_url
+        elif len(content) > 2 and not content.startswith("/") and not content.startswith("!"):
+            # Tên bài hát dạng chữ trong kênh âm nhạc
+            query = content
 
-    if query:
-        try:
-            await message.add_reaction("🎵")
-        except Exception:
-            pass
-        await process_and_play(message.channel, query, message.author)
+    if not query:
+        return
+
+    # Lọc lại lần cuối nếu query là URL không phải nhạc (như link discord.gg)
+    if query.startswith("http://") or query.startswith("https://"):
+        if any(domain in query.lower() for domain in EXCLUDED_NON_MUSIC_DOMAINS):
+            return
+
+    try:
+        await message.add_reaction("🎵")
+    except Exception:
+        pass
+    await process_and_play(message.channel, query, message.author)
 
 # ==================== TEXT & SLASH ACTION HELPERS ====================
 async def do_skip(send_target):
