@@ -533,14 +533,40 @@ async def process_and_play(send_target, query: str, requester: discord.User | di
         else:
             await send_target.send(embed=embed)
 
+# ==================== CROSS KEEP-ALIVE (PING MAIN-BOT 24/7) ====================
+MAIN_BOT_KEEP_ALIVE_URL = "https://my-discord-bot-mc3p.onrender.com/"
+
+@tasks.loop(minutes=3)
+async def keep_main_bot_alive_task():
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(MAIN_BOT_KEEP_ALIVE_URL, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 200:
+                    logger.debug("💓 [KeepAlive] Đã gửi ping tới Main Bot thành công.")
+    except Exception as e:
+        logger.warning(f"⚠️ [KeepAlive] Lỗi gửi ping tới Main Bot: {e}")
+
+@keep_main_bot_alive_task.before_loop
+async def before_keep_main_bot_alive_task():
+    await bot.wait_until_ready()
+
 # ==================== 24/7 VOICE MONITOR TASK ====================
-@tasks.loop(seconds=15)
+@tasks.loop(seconds=10)
 async def voice_health_check():
     guild = bot.get_guild(config.OFFICIAL_GUILD_ID)
     if not guild:
         return
 
+    # Xác định chính xác kênh âm nhạc
+    target_ch = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
+    if not target_ch:
+        target_ch = discord.utils.find(lambda c: "nhạc" in c.name.lower() or "music" in c.name.lower(), guild.voice_channels)
+
+    if not target_ch:
+        return
+
     vc = guild.voice_client
+
     # 1. Phát hiện và xử lý Zombie Voice Client (mất kết nối nhưng client chưa giải phóng)
     if vc and not vc.is_connected():
         logger.warning("⚠️ [HealthCheck] Phát hiện Voice Client zombie -> Force disconnect và làm mới...")
@@ -553,29 +579,27 @@ async def voice_health_check():
             await vc.disconnect(force=True)
         except Exception as e:
             logger.warning(f"Lỗi disconnect zombie: {e}")
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.0)
         vc = None
 
     # 2. Đảm bảo bot luôn kết nối vào phòng Custom Music
     if not vc or not vc.is_connected():
-        logger.info("🔄 [HealthCheck] Tự động kết nối cố định vào phòng 🎵・Custom Music...")
+        logger.info(f"🔄 [HealthCheck] Tự động kết nối cố định vào phòng [{target_ch.name}]...")
         vc = await get_or_join_voice_client(guild)
         if vc and not vc.is_playing():
             await start_idle_music(guild)
     else:
-        # Nếu đang ở khác phòng Custom Music, đưa về Custom Music
-        if vc.channel and vc.channel.id != config.CUSTOM_MUSIC_CHANNEL_ID:
-            base_ch = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
-            if base_ch:
-                await vc.move_to(base_ch)
+        # Nếu đang ở khác phòng nhạc, đưa về phòng nhạc
+        if vc.channel and vc.channel.id != target_ch.id:
+            try:
+                await vc.move_to(target_ch)
+            except Exception as e:
+                logger.warning(f"Lỗi move_to phòng nhạc: {e}")
 
         # Nếu đã kết nối nhưng KHÔNG phát gì -> phát tiếp
         if not vc.is_playing() and not vc.is_paused():
             logger.info("🔊 [HealthCheck] Bot đang im lặng trong phòng voice -> Tiếp tục phát nhạc...")
             play_next(guild)
-
-    # 3. Kênh nghe nhạc được bảo vệ qua Discord Permission Overwrites (Speak=False, Stream=False)
-    # Không dùng Server-Mute bằng mã lệnh để tránh vòng lặp xung đột mở/chặn mic trên client người dùng.
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -591,6 +615,10 @@ async def on_ready():
     logger.info(f"👑 MUSIC SUB-BOT ĐÃ SẴN SÀNG: {bot.user.name}#{bot.user.discriminator} (ID: {bot.user.id})")
     if not voice_health_check.is_running():
         voice_health_check.start()
+
+    if not keep_main_bot_alive_task.is_running():
+        keep_main_bot_alive_task.start()
+        logger.info("💓 Đã kích hoạt tác vụ Keep-Alive ping Main Bot mỗi 3 phút!")
 
     # Đảm bảo quyền hạn phòng nghe nhạc: Listen-Only tuyệt đối ở tầng Discord Permission
     try:
