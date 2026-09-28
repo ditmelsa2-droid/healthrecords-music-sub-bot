@@ -325,18 +325,26 @@ def create_pcm_source(track: dict, volume: float = 1.0) -> discord.PCMVolumeTran
 # ==================== VOICE & PLAYBACK CORE (LOCKED TO CUSTOM MUSIC) ====================
 async def reconnect_after_kick(guild: discord.Guild):
     logger.info("🔄 Tiến hành tự động kết nối lại sau khi bị ngắt kết nối...")
+    if guild.voice_client:
+        try:
+            if guild.voice_client.is_playing():
+                guild.voice_client.stop()
+            await guild.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
     vc = await get_or_join_voice_client(guild)
     if vc and not vc.is_playing():
         await start_idle_music(guild)
 
 async def get_or_join_voice_client(guild: discord.Guild) -> discord.VoiceClient | None:
-    """Đảm bảo bot luôn luôn kết nối vào phòng DUY NHẤT: 🎵・Custom Music."""
+    """Đảm bảo bot luôn luôn kết nối vào phòng DUY NHẤT: 🎵・Phòng Nghe Nhạc."""
     target_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
     if not target_channel:
-        target_channel = discord.utils.find(lambda c: "custom music" in c.name.lower() or "nhạc" in c.name.lower(), guild.voice_channels)
+        target_channel = discord.utils.find(lambda c: "custom music" in c.name.lower() or "nhạc" in c.name.lower() or "music" in c.name.lower(), guild.voice_channels)
 
     if not target_channel:
-        logger.error("❌ Không tìm thấy phòng Custom Music trong server!")
+        logger.error("❌ Không tìm thấy phòng nghe nhạc trong server!")
         return None
 
     # Nếu bot đã có voice_client trong server:
@@ -361,23 +369,26 @@ async def get_or_join_voice_client(guild: discord.Guild) -> discord.VoiceClient 
                 await vc.disconnect(force=True)
             except Exception as e:
                 logger.warning(f"Lỗi disconnect zombie vc: {e}")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
-    # Kết nối mới
+    # Kết nối mới: reconnect=False để tránh lỗi WebSocket 4006 (Session no longer valid)
     try:
-        vc = await target_channel.connect(reconnect=True, timeout=25.0)
+        vc = await target_channel.connect(reconnect=False, timeout=20.0)
         logger.info(f"✅ Đã kết nối thành công vào phòng [{target_channel.name}]")
         return vc
     except Exception as e:
         logger.error(f"Lỗi kết nối phòng voice: {e}")
-        # Nếu Discord vẫn báo Already connected -> Ép disconnect lần cuối rồi thử lại
-        if "already connected" in str(e).lower() and guild.voice_client:
+        # Nếu Discord vẫn báo Already connected -> Ép disconnect sạch rồi thử lại với phiên mới
+        if guild.voice_client:
             try:
                 if guild.voice_client.is_playing():
                     guild.voice_client.stop()
                 await guild.voice_client.disconnect(force=True)
-                await asyncio.sleep(1.5)
-                vc = await target_channel.connect(reconnect=True, timeout=25.0)
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+            try:
+                vc = await target_channel.connect(reconnect=False, timeout=20.0)
                 logger.info(f"✅ Đã kết nối lại thành công sau retry force disconnect!")
                 return vc
             except Exception as ex2:
@@ -423,7 +434,12 @@ def play_next(guild: discord.Guild):
 
 async def handle_after_playback(guild: discord.Guild):
     await asyncio.sleep(1)
-    play_next(guild)
+    if not guild or not guild.voice_client or not guild.voice_client.is_connected():
+        vc = await get_or_join_voice_client(guild)
+        if vc and not vc.is_playing():
+            await start_idle_music(guild)
+    else:
+        play_next(guild)
 
 async def start_idle_music(guild: discord.Guild):
     if not guild or not guild.voice_client:
