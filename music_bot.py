@@ -574,18 +574,8 @@ async def voice_health_check():
             logger.info("🔊 [HealthCheck] Bot đang im lặng trong phòng voice -> Tiếp tục phát nhạc...")
             play_next(guild)
 
-    # 3. Đảm bảo tắt mic cho tất cả mọi người trong Custom Music để nghe nhạc tập trung
-    base_ch = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
-    if not base_ch:
-        base_ch = discord.utils.find(lambda c: "custom" in c.name.lower() and "music" in c.name.lower(), guild.voice_channels)
-    if base_ch:
-        for m in base_ch.members:
-            if not m.bot and m.voice and not m.voice.mute:
-                try:
-                    await m.edit(mute=True, reason="Kênh Custom Music: Tự động tắt mic nghe nhạc")
-                    logger.info(f"🔇 Sub-bot: Đã tắt mic định kỳ cho {m.display_name} trong phòng Custom Music")
-                except Exception as e:
-                    logger.warning(f"Không thể tắt mic cho {m.display_name}: {e}")
+    # 3. Kênh nghe nhạc được bảo vệ qua Discord Permission Overwrites (Speak=False, Stream=False)
+    # Không dùng Server-Mute bằng mã lệnh để tránh vòng lặp xung đột mở/chặn mic trên client người dùng.
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -596,34 +586,32 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             bot.loop.call_later(2, lambda: asyncio.create_task(reconnect_after_kick(member.guild)))
         return
 
-    if member.bot:
-        return
-
-    is_custom_music_after = after.channel and (
-        after.channel.id == config.CUSTOM_MUSIC_CHANNEL_ID or
-        ("custom" in after.channel.name.lower() and "music" in after.channel.name.lower())
-    )
-
-    if is_custom_music_after:
-        if member.voice and not member.voice.mute:
-            try:
-                await member.edit(mute=True, reason="Kênh Custom Music: Tự động tắt mic nghe nhạc")
-                logger.info(f"🔇 Sub-bot: Đã tắt mic cho {member.display_name} trong phòng Custom Music")
-            except Exception as e:
-                logger.warning(f"Không thể tắt mic cho {member.display_name}: {e}")
-    elif after.channel and not is_custom_music_after:
-        if member.voice and member.voice.mute:
-            try:
-                await member.edit(mute=False, reason="Ở phòng thoại thông thường: Mở lại mic tự do")
-                logger.info(f"🔊 Sub-bot: Đã mở mic lại cho {member.display_name} tại {after.channel.name}")
-            except Exception as e:
-                logger.warning(f"Không thể mở mic cho {member.display_name}: {e}")
-
 @bot.event
 async def on_ready():
     logger.info(f"👑 MUSIC SUB-BOT ĐÃ SẴN SÀNG: {bot.user.name}#{bot.user.discriminator} (ID: {bot.user.id})")
     if not voice_health_check.is_running():
         voice_health_check.start()
+
+    # Đảm bảo quyền hạn phòng nghe nhạc: Listen-Only tuyệt đối ở tầng Discord Permission
+    try:
+        guild = bot.get_guild(config.OFFICIAL_GUILD_ID)
+        if guild:
+            ch = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
+            if not ch:
+                ch = discord.utils.find(lambda c: "nhạc" in c.name.lower() or "music" in c.name.lower(), guild.voice_channels)
+            if ch:
+                current_ow = ch.overwrites_for(guild.default_role)
+                if current_ow.speak is not False or current_ow.stream is not False or current_ow.use_soundboard is not False:
+                    current_ow.speak = False
+                    current_ow.stream = False
+                    current_ow.use_soundboard = False
+                    current_ow.use_external_sounds = False
+                    current_ow.use_embedded_activities = False
+                    current_ow.connect = True
+                    await ch.set_permissions(guild.default_role, overwrite=current_ow, reason="Bảo vệ phòng nghe nhạc: Listen-Only")
+                    logger.info("🔒 Đã thiết lập Listen-Only (không mic, không cam) cho @everyone trong phòng nhạc!")
+    except Exception as e:
+        logger.warning(f"Không thể kiểm tra phân quyền phòng nhạc: {e}")
 
 # ==================== CHAT MESSAGE LISTENER (AUTO-PLAY ON PASTE) ====================
 EXCLUDED_NON_MUSIC_DOMAINS = (
