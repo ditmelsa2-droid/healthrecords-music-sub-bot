@@ -58,7 +58,7 @@ YTDL_OPTIONS = {
     'default_search': 'ytsearch1:',
     'extractor_args': {
         'youtube': {
-            'player_client': ['web_embedded', 'android', 'mweb']
+            'player_client': ['android_vr', 'tv_embedded', 'android', 'web_creator']
         }
     }
 }
@@ -178,8 +178,43 @@ class MusicSubBot(commands.Bot):
 bot = MusicSubBot()
 
 # ==================== AUDIO EXTRACTION ENGINE ====================
-def fetch_youtube_oembed_title(url: str) -> tuple[str, str]:
-    """Lấy tiêu đề YouTube an toàn 100% qua oEmbed API không bao giờ bị chặn IP."""
+def clean_song_title(raw: str) -> list[str]:
+    """Tách và làm sạch tiêu đề bài hát để tìm kiếm chính xác 100% trên SoundCloud/YouTube."""
+    if not raw:
+        return []
+    # 1. Xóa các tag đóng mở ngoặc [] () chứa rác metadata
+    cleaned = re.sub(r'(?i)\[(official|mv|lyrics?|audio|vietsub|remix|4k|hd|karaoke|beat|slowed|reverb|prod|m/v).*?\]', '', raw)
+    cleaned = re.sub(r'(?i)\((official|mv|lyrics?|audio|vietsub|remix|4k|hd|karaoke|beat|slowed|reverb|prod|m/v).*?\)', '', cleaned)
+    # 2. Xóa các từ khóa metadata đứng lẻ
+    cleaned = re.sub(r'(?i)\b(lyrics?|official\s+video|official\s+audio|music\s+video|official\s+mv|mv|audio|vietsub|video\s+lyric|lyric\s+video)\b', '', cleaned)
+    
+    # 3. Tách theo dấu gạch ngang, gạch đứng |, dấu chấm tròn •
+    # Lưu ý: Chỉ tách dấu slash '/' khi có khoảng trắng xung quanh để tránh làm hỏng tên nghệ sĩ như W/n hay AC/DC
+    parts = re.split(r'\s*[|•~–—]\s*|\s+/\s+', cleaned)
+    candidates = []
+    for p in parts:
+        p_clean = re.sub(r'[\r\n\t]', ' ', p).strip(' -_–—|')
+        # Bỏ qua các cụm quảng cáo kênh YouTube
+        if len(p_clean) >= 2 and not re.search(r'(?i)(nhạc chill|đăng ký|hot tiktok|bản quyền|subscribe|full album|tổng hợp)', p_clean):
+            candidates.append(p_clean)
+
+    results = []
+    # Candidate ưu tiên 1: Ghép 2 phần đầu nếu có (thường là Tên bài hát + Tên tác giả)
+    if len(candidates) >= 2:
+        results.append(f"{candidates[0]} {candidates[1]}")
+    # Candidate từng phần
+    for c in candidates:
+        if c not in results:
+            results.append(c)
+    # Thêm bản raw đã loại bỏ bớt rác
+    simple_raw = re.sub(r'[|•~]', ' ', cleaned).strip()
+    if simple_raw and simple_raw not in results:
+        results.append(simple_raw)
+
+    return results
+
+def fetch_youtube_oembed_title(url: str) -> tuple[str, str, str]:
+    """Lấy tiêu đề, tác giả, thumbnail YouTube an toàn 100% qua oEmbed API không bao giờ bị chặn IP."""
     try:
         req = urllib.request.Request(
             f"https://www.youtube.com/oembed?url={urllib.parse.quote(url)}&format=json",
@@ -187,19 +222,22 @@ def fetch_youtube_oembed_title(url: str) -> tuple[str, str]:
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
-            return data.get('title', ''), data.get('author_name', '')
+            return data.get('title', ''), data.get('author_name', ''), data.get('thumbnail_url', '')
     except Exception:
-        return '', ''
+        return '', '', ''
 
 async def extract_audio_info(query: str) -> dict | None:
     loop = asyncio.get_event_loop()
+    query = query.strip()
     is_yt_link = "youtube.com" in query or "youtu.be" in query
+    is_sc_link = "soundcloud.com" in query
 
     clean_yt_url = query
     oembed_title = ""
     oembed_author = ""
+    oembed_thumb = ""
 
-    # Làm sạch URL nếu là link YouTube
+    # Chuẩn hóa link YouTube nếu người dùng dán URL
     if is_yt_link:
         parsed = urllib.parse.urlparse(query)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -209,12 +247,15 @@ async def extract_audio_info(query: str) -> dict | None:
             vid = parsed.path.strip("/").split("?")[0]
             clean_yt_url = f"https://www.youtube.com/watch?v={vid}"
 
-        oembed_title, oembed_author = await loop.run_in_executor(None, lambda: fetch_youtube_oembed_title(clean_yt_url))
+        oembed_title, oembed_author, oembed_thumb = await loop.run_in_executor(
+            None, lambda: fetch_youtube_oembed_title(clean_yt_url)
+        )
 
-    # TẦNG 1: Trích xuất YouTube qua yt-dlp
+    # ==================== TẦNG 1: DIRECT YOUTUBE STREAM ====================
     if is_yt_link:
         try:
-            data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(clean_yt_url, download=False))
+            ydl_target = ytdl if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 100 else ytdl_nocookie
+            data = await loop.run_in_executor(None, lambda: ydl_target.extract_info(clean_yt_url, download=False))
             if data:
                 audio_url = data.get('url')
                 headers = data.get('http_headers', {})
@@ -227,50 +268,82 @@ async def extract_audio_info(query: str) -> dict | None:
                             headers = formats[0].get('http_headers')
 
                 if audio_url:
+                    logger.info(f"✅ Tầng 1 YouTube Direct thành công: {data.get('title')}")
                     return {
-                        'title': data.get('title', oembed_title or 'Unknown Title'),
+                        'title': data.get('title', oembed_title or 'YouTube Audio'),
                         'url': audio_url,
                         'headers': headers,
                         'webpage_url': data.get('webpage_url', clean_yt_url),
                         'duration': data.get('duration', 0),
-                        'thumbnail': data.get('thumbnail'),
+                        'thumbnail': data.get('thumbnail', oembed_thumb),
                         'uploader': data.get('uploader', oembed_author or 'YouTube'),
                         'is_idle': False
                     }
         except Exception as e:
-            logger.warning(f"Tầng 1 YouTube bị chặn ({e}). Tự động kích hoạt Cứu hộ SoundCloud HQ...")
+            logger.warning(f"⚠️ Tầng 1 YouTube bị chặn/lỗi ({e}). Tự động kích hoạt Cứu hộ đa tầng...")
 
-    # TẦNG 2: Cứu hộ tự động qua SoundCloud HQ (Không chặn IP Datacenter)
-    sc_query_term = oembed_title if oembed_title else re.sub(r'https?://[^\s]+', '', query).strip()
-    if not sc_query_term:
-        sc_query_term = query.split("/")[-1].replace("-", " ")
+    # ==================== TẦNG 2: SOUNDCLOUD HQ RESCUE ====================
+    search_queries = []
+    if oembed_title:
+        search_queries.extend(clean_song_title(oembed_title))
+    elif not is_yt_link and not is_sc_link:
+        search_queries.append(query)
+        search_queries.extend(clean_song_title(query))
+    elif is_sc_link:
+        search_queries.append(query)
 
-    if "soundcloud.com" in query:
-        sc_target = query
-    else:
-        sc_target = f"scsearch5:{sc_query_term}"
+    for q_candidate in search_queries:
+        sc_target = q_candidate if is_sc_link else f"scsearch3:{q_candidate}"
+        try:
+            data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(sc_target, download=False))
+            if data:
+                entry = data['entries'][0] if 'entries' in data and data['entries'] else data
+                audio_url = entry.get('url')
+                if audio_url:
+                    song_title = oembed_title if oembed_title else entry.get('title', q_candidate)
+                    logger.info(f"✅ Tầng 2 SoundCloud cứu hộ thành công với query [{q_candidate}]: {song_title}")
+                    return {
+                        'title': f"{song_title} [HQ Stream]" if is_yt_link else song_title,
+                        'url': audio_url,
+                        'headers': entry.get('http_headers', {}),
+                        'webpage_url': clean_yt_url if is_yt_link else entry.get('webpage_url', query),
+                        'duration': entry.get('duration', 0),
+                        'thumbnail': oembed_thumb if oembed_thumb else entry.get('thumbnail'),
+                        'uploader': oembed_author if oembed_author else entry.get('uploader', 'SoundCloud'),
+                        'is_idle': False
+                    }
+        except Exception:
+            pass
 
-    logger.info(f"🔄 Kích hoạt Tầng 2 SoundCloud HQ: {sc_target}")
-    try:
-        data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(sc_target, download=False))
-        if data:
-            entry = data['entries'][0] if 'entries' in data and data['entries'] else data
-            audio_url = entry.get('url')
-            if audio_url:
-                title = entry.get('title', oembed_title or sc_query_term)
-                logger.info(f"✅ Tầng 2 cứu hộ thành công: {title}")
-                return {
-                    'title': f"{title} [HQ Stream]",
-                    'url': audio_url,
-                    'headers': entry.get('http_headers', {}),
-                    'webpage_url': entry.get('webpage_url', clean_yt_url),
-                    'duration': entry.get('duration', 0),
-                    'thumbnail': entry.get('thumbnail'),
-                    'uploader': entry.get('uploader', 'SoundCloud'),
-                    'is_idle': False
-                }
-    except Exception as e:
-        logger.error(f"Tầng 2 thất bại: {e}")
+    # ==================== TẦNG 3: YOUTUBE SEARCH FALLBACK ====================
+    fallback_terms = search_queries if search_queries else [query]
+    for fb in fallback_terms:
+        yt_search_target = f"ytsearch3:{fb}"
+        try:
+            data = await loop.run_in_executor(None, lambda: ytdl_nocookie.extract_info(yt_search_target, download=False))
+            if data and data.get('entries'):
+                entry = data['entries'][0]
+                audio_url = entry.get('url')
+                if not audio_url and 'formats' in entry:
+                    fmts = [f for f in entry['formats'] if f.get('acodec') != 'none']
+                    if fmts:
+                        fmts.sort(key=lambda f: f.get('abr') or 0, reverse=True)
+                        audio_url = fmts[0].get('url')
+
+                if audio_url:
+                    logger.info(f"✅ Tầng 3 YouTube Search thành công với [{fb}]: {entry.get('title')}")
+                    return {
+                        'title': entry.get('title', fb),
+                        'url': audio_url,
+                        'headers': entry.get('http_headers', {}),
+                        'webpage_url': entry.get('webpage_url', clean_yt_url if is_yt_link else ''),
+                        'duration': entry.get('duration', 0),
+                        'thumbnail': entry.get('thumbnail', oembed_thumb),
+                        'uploader': entry.get('uploader', 'YouTube'),
+                        'is_idle': False
+                    }
+        except Exception:
+            pass
 
     return None
 
