@@ -253,34 +253,41 @@ async def extract_audio_info(query: str) -> dict | None:
 
     # ==================== TẦNG 1: DIRECT YOUTUBE STREAM ====================
     if is_yt_link:
-        try:
-            ydl_target = ytdl if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 100 else ytdl_nocookie
-            data = await loop.run_in_executor(None, lambda: ydl_target.extract_info(clean_yt_url, download=False))
-            if data:
-                audio_url = data.get('url')
-                headers = data.get('http_headers', {})
-                if not audio_url and 'formats' in data:
-                    formats = [f for f in data['formats'] if f.get('acodec') != 'none']
-                    if formats:
-                        formats.sort(key=lambda f: f.get('abr') or 0, reverse=True)
-                        audio_url = formats[0].get('url')
-                        if formats[0].get('http_headers'):
-                            headers = formats[0].get('http_headers')
+        targets_to_try = []
+        if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 100:
+            targets_to_try.append(("Cookies", ytdl))
+        targets_to_try.append(("NoCookies", ytdl_nocookie))
 
-                if audio_url:
-                    logger.info(f"✅ Tầng 1 YouTube Direct thành công: {data.get('title')}")
-                    return {
-                        'title': data.get('title', oembed_title or 'YouTube Audio'),
-                        'url': audio_url,
-                        'headers': headers,
-                        'webpage_url': data.get('webpage_url', clean_yt_url),
-                        'duration': data.get('duration', 0),
-                        'thumbnail': data.get('thumbnail', oembed_thumb),
-                        'uploader': data.get('uploader', oembed_author or 'YouTube'),
-                        'is_idle': False
-                    }
-        except Exception as e:
-            logger.warning(f"⚠️ Tầng 1 YouTube bị chặn/lỗi ({e}). Tự động kích hoạt Cứu hộ đa tầng...")
+        for mode_name, ydl_target in targets_to_try:
+            try:
+                data = await loop.run_in_executor(None, lambda y=ydl_target: y.extract_info(clean_yt_url, download=False))
+                if data:
+                    audio_url = data.get('url')
+                    headers = data.get('http_headers', {})
+                    if not audio_url and 'formats' in data:
+                        formats = [f for f in data['formats'] if f.get('acodec') != 'none']
+                        if formats:
+                            formats.sort(key=lambda f: f.get('abr') or 0, reverse=True)
+                            audio_url = formats[0].get('url')
+                            if formats[0].get('http_headers'):
+                                headers = formats[0].get('http_headers')
+
+                    if audio_url:
+                        logger.info(f"✅ Tầng 1 YouTube Direct ({mode_name}) thành công: {data.get('title')}")
+                        return {
+                            'title': data.get('title', oembed_title or 'YouTube Audio'),
+                            'url': audio_url,
+                            'headers': headers,
+                            'webpage_url': data.get('webpage_url', clean_yt_url),
+                            'duration': data.get('duration', 0),
+                            'thumbnail': data.get('thumbnail', oembed_thumb),
+                            'uploader': data.get('uploader', oembed_author or 'YouTube'),
+                            'is_idle': False
+                        }
+            except Exception as e:
+                logger.warning(f"⚠️ Tầng 1 YouTube ({mode_name}) gặp lỗi: {e}")
+
+        logger.warning("⚠️ Cả 2 chế độ YouTube Direct đều không thành công. Kích hoạt Cứu hộ đa tầng...")
 
     # ==================== TẦNG 2: SOUNDCLOUD HQ RESCUE ====================
     search_queries = []
