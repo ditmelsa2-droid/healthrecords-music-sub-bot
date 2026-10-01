@@ -404,76 +404,69 @@ def create_pcm_source(track: dict, volume: float = 1.0) -> discord.PCMVolumeTran
 
 # ==================== VOICE & PLAYBACK CORE (LOCKED TO CUSTOM MUSIC) ====================
 async def reconnect_after_kick(guild: discord.Guild):
-    logger.info("🔄 Tiến hành tự động kết nối lại sau khi bị ngắt kết nối...")
-    if guild.voice_client:
-        try:
-            if guild.voice_client.is_playing():
-                guild.voice_client.stop()
-            await guild.voice_client.disconnect(force=True)
-        except Exception:
-            pass
-        await asyncio.sleep(1.0)
+    logger.info("🔄 Tiến hành kiểm tra và kết nối lại sau sự kiện voice...")
     vc = await get_or_join_voice_client(guild)
-    if vc and not vc.is_playing():
+    if vc and not vc.is_playing() and not vc.is_paused():
         await start_idle_music(guild)
 
 async def get_or_join_voice_client(guild: discord.Guild) -> discord.VoiceClient | None:
-    """Đảm bảo bot luôn luôn kết nối vào phòng DUY NHẤT: 🎵・Phòng Nghe Nhạc."""
-    target_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
-    if not target_channel:
-        target_channel = discord.utils.find(lambda c: "custom music" in c.name.lower() or "nhạc" in c.name.lower() or "music" in c.name.lower(), guild.voice_channels)
+    """Đảm bảo bot luôn luôn kết nối vào phòng DUY NHẤT: 🎵・Phòng Nghe Nhạc (được đồng bộ bằng bot.lock)."""
+    async with bot.lock:
+        target_channel = guild.get_channel(config.CUSTOM_MUSIC_CHANNEL_ID)
+        if not target_channel:
+            target_channel = discord.utils.find(lambda c: "custom music" in c.name.lower() or "nhạc" in c.name.lower() or "music" in c.name.lower(), guild.voice_channels)
 
-    if not target_channel:
-        logger.error("❌ Không tìm thấy phòng nghe nhạc trong server!")
-        return None
+        if not target_channel:
+            logger.error("❌ Không tìm thấy phòng nghe nhạc trong server!")
+            return None
 
-    # Nếu bot đã có voice_client trong server:
-    if guild.voice_client:
-        vc = guild.voice_client
-        if vc.is_connected():
-            if vc.channel and vc.channel.id != target_channel.id:
-                logger.info(f"🔄 Đưa bot về cố định tại phòng [{target_channel.name}]")
-                try:
-                    await vc.move_to(target_channel)
-                except Exception as e:
-                    logger.warning(f"Lỗi move_to: {e}")
-            return vc
-        else:
-            logger.warning("⚠️ Phát hiện Voice Client zombie (mất kết nối) -> Force disconnect sạch...")
-            try:
-                if vc.is_playing():
-                    vc.stop()
-            except Exception:
-                pass
-            try:
-                await vc.disconnect(force=True)
-            except Exception as e:
-                logger.warning(f"Lỗi disconnect zombie vc: {e}")
-            await asyncio.sleep(1.0)
-
-    # Kết nối mới: reconnect=False để tránh lỗi WebSocket 4006 (Session no longer valid)
-    try:
-        vc = await target_channel.connect(reconnect=False, timeout=20.0)
-        logger.info(f"✅ Đã kết nối thành công vào phòng [{target_channel.name}]")
-        return vc
-    except Exception as e:
-        logger.error(f"Lỗi kết nối phòng voice: {e}")
-        # Nếu Discord vẫn báo Already connected -> Ép disconnect sạch rồi thử lại với phiên mới
+        # Nếu bot đã có voice_client hợp lệ trong server:
         if guild.voice_client:
-            try:
-                if guild.voice_client.is_playing():
-                    guild.voice_client.stop()
-                await guild.voice_client.disconnect(force=True)
-            except Exception:
-                pass
-            await asyncio.sleep(1.5)
-            try:
-                vc = await target_channel.connect(reconnect=False, timeout=20.0)
-                logger.info(f"✅ Đã kết nối lại thành công sau retry force disconnect!")
+            vc = guild.voice_client
+            if vc.is_connected():
+                if vc.channel and vc.channel.id != target_channel.id:
+                    logger.info(f"🔄 Đưa bot về cố định tại phòng [{target_channel.name}]")
+                    try:
+                        await vc.move_to(target_channel)
+                    except Exception as e:
+                        logger.warning(f"Lỗi move_to: {e}")
                 return vc
-            except Exception as ex2:
-                logger.error(f"Lỗi kết nối lại sau retry: {ex2}")
-        return None
+            else:
+                logger.warning("⚠️ Phát hiện Voice Client zombie (mất kết nối) -> Dọn dẹp...")
+                try:
+                    if vc.is_playing():
+                        vc.stop()
+                except Exception:
+                    pass
+                try:
+                    await vc.disconnect(force=True)
+                except Exception as e:
+                    logger.warning(f"Lỗi disconnect zombie vc: {e}")
+                await asyncio.sleep(1.0)
+
+        # Kết nối mới: reconnect=False để tránh lỗi WebSocket 4006 (Session no longer valid)
+        try:
+            vc = await target_channel.connect(reconnect=False, timeout=20.0)
+            logger.info(f"✅ Đã kết nối thành công vào phòng [{target_channel.name}]")
+            return vc
+        except Exception as e:
+            logger.error(f"Lỗi kết nối phòng voice: {e}")
+            # Nếu Discord vẫn báo Already connected -> Ép disconnect sạch rồi thử lại với phiên mới
+            if guild.voice_client:
+                try:
+                    if guild.voice_client.is_playing():
+                        guild.voice_client.stop()
+                    await guild.voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.5)
+                try:
+                    vc = await target_channel.connect(reconnect=False, timeout=20.0)
+                    logger.info(f"✅ Đã kết nối lại thành công sau retry force disconnect!")
+                    return vc
+                except Exception as ex2:
+                    logger.error(f"Lỗi kết nối lại sau retry: {ex2}")
+            return None
 
 def play_next(guild: discord.Guild):
     if not guild or not guild.voice_client:
@@ -702,8 +695,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     # Nếu chính Sub-Bot bị ngắt kết nối voice (gateway restart, network glitch, v.v.):
     if member.id == bot.user.id:
         if before.channel and not after.channel:
-            logger.warning("⚠️ Sub-Bot vừa bị ngắt khỏi phòng voice! Lên lịch kết nối lại trong 2s...")
-            bot.loop.call_later(2, lambda: asyncio.create_task(reconnect_after_kick(member.guild)))
+            vc = member.guild.voice_client
+            if not vc or not vc.is_connected():
+                logger.warning("⚠️ Sub-Bot vừa bị ngắt khỏi phòng voice! Lên lịch kết nối lại trong 3s...")
+                bot.loop.call_later(3, lambda: asyncio.create_task(reconnect_after_kick(member.guild)))
         return
 
 @bot.event
